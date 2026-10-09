@@ -18,7 +18,7 @@ Requires Blender 5.2 or newer (it relies on ``Extrude Mesh``'s ``Top`` /
 bl_info = {
     "name": "BI1MCS_GN",
     "author": "BI1MCS",
-    "version": (0, 1, 0),
+    "version": (0, 1, 1),
     "blender": (5, 2, 0),
     "location": "Node Editor > Add > BI1MCS > Inset Faces",
     "description": ("Geometry-Nodes toolset. 'Inset Faces' reproduces the "

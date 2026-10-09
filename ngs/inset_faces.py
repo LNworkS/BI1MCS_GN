@@ -378,6 +378,12 @@ def build(group_name=GROUP_NAME):
     CNTA_v = _acc(nt, (X, 960), "CORNER", "FLOAT", vert_i, onek)
 
     # ---------------- lift corner group totals to POINT -------------------
+    # `CornersOfVertex(Index)` is only correct when this subtree is evaluated in
+    # the *point* domain (there `Index` is the vertex id, so it really is "some
+    # corner of my vertex").  Every reader below feeds the displacement chain,
+    # which ends in Set Position's point-domain Offset, so this is the right
+    # form here.  A reader that is consumed in the *corner* domain must take the
+    # Accumulate Field output directly instead - see the rail block.
     cov = _n(nt, "GeometryNodeCornersOfVertex", (X + 260, 300))
     _l(nt, px, cov.inputs["Vertex Index"])
     anyc = cov.outputs["Corner Index"]
@@ -421,73 +427,117 @@ def build(group_name=GROUP_NAME):
     tvec_plain = _sw(nt, (X + 400, 60), "VECTOR", C_gt0, false=VZERO, true=tvec_plain)
 
     # ---------------- edge rail (bmo_inset.cc lines 932..956) -------------
-    # Fires when the vertex carries two tagged edges whose tagged faces share
-    # an edge *through that vertex* (bmesh reaches the same place through the
-    # vertex/edge separation: `l_other_a->v == l_other_b->v`).  The offset then
-    # runs along that shared edge instead of between the two edge normals, and
-    # `even` scales by the larger of the two edge angles (= smaller |dot|).
+    # bmesh takes the branch when the vertex carries >= 2 tagged edges, the
+    # first two belong to *different* faces, and those two faces share an edge
+    # through the vertex.  It detects that with `l_other_a->v == l_other_b->v`,
+    # i.e. the far ends of each face's *other* edge at v agree.  The offset then
+    # runs along that shared edge instead of between the two edge tangents.
+    #
+    # Corner-domain translation.  A region-boundary edge is registered at the
+    # corner that starts it (`contrib`) or, when the face loop traverses it the
+    # other way, as `contrib_prev` of that corner.  So for a corner c = (f, v):
+    #
+    #   contrib_any(c) = A(c) + B(c)   how many of f's two edges at v are
+    #                                  region-boundary edges
+    #   solo(c)        = contrib_any(c) == 1   -> f's *other* edge at v is the
+    #                                  candidate shared edge
+    #   d_far(c)       = A ? prev_vertex - v : next_vertex - v
+    #                                  direction to that edge's far end
+    #
+    # The two corners at v are the two faces of one shared edge exactly when
+    # both are solo and their `d_far` coincide.  So the branch fires when every
+    # solo corner at v has the same `d_far`, and a sum-only test can express
+    # that as zero variance:
+    #   n = sum(solo),  S = sum(d_far),  Q = sum(|d_far|^2)
+    #   Q - |S|^2 / n == 0   <=>   all `d_far` equal
+    # `d_far` is measured from the vertex, so "equal" is bitwise equal and the
+    # variance lands on exactly 0 for n == 2 (the common case).
     XR = X0 + 6200
     e_prev = eoc.outputs["Previous Edge Index"]
-    hasF_b = _bool(nt, (XR, 0), "OR", contrib_b, contrib_prev)
-    hasFf = _sw(nt, (XR + 200, 0), "FLOAT", hasF_b, false=ZERO, true=ONE)
-    nFp = _acc(nt, (XR + 400, 0), "CORNER", "FLOAT", e_prev, hasFf)
-    nFn = _acc(nt, (XR + 400, 180), "CORNER", "FLOAT", e_this, hasFf)
-    trig_p = _bool(nt, (XR + 620, 0), "AND", contrib_b,
-                   _cmp(nt, (XR + 620, 90), "FLOAT", "GREATER_THAN", nFp, vs1_5))
-    trig_n = _bool(nt, (XR + 620, 280), "AND", contrib_prev,
-                   _cmp(nt, (XR + 620, 370), "FLOAT", "GREATER_THAN", nFn, vs1_5))
-    trig_b = _bool(nt, (XR + 840, 160), "OR", trig_p, trig_n)
+    solo_f = _cmp(nt, (XR, 60), "FLOAT", "EQUAL", contrib_any, ONE)
+    far_v = _sw(nt, (XR, 200), "VECTOR", contrib_b, false=pv_n, true=pv_p)
+    d_far = _vm(nt, (XR + 200, 200), "SUBTRACT", far_v, pv)
+    solo_one = _sw(nt, (XR + 200, 60), "FLOAT", solo_f, false=ZERO, true=ONE)
+    # NB: these three are consumed by corner-domain maths only, so they must be
+    # the raw Accumulate Field outputs (which are already corner fields, constant
+    # per vertex).  Wrapping them in `pt()` would re-sample them through the
+    # *point*-domain `CornersOfVertex` lookup and, evaluated in the corner
+    # domain, read a stranger vertex's total.
+    n_solo = _acc(nt, (XR + 460, -60), "CORNER", "FLOAT", vert_i, solo_one)
+    s_dv = _acc(nt, (XR + 460, 80), "CORNER", "FLOAT_VECTOR", vert_i,
+                _scale(nt, (XR + 260, 200), d_far, solo_one))
+    q_dv = _acc(nt, (XR + 460, 240), "CORNER", "FLOAT", vert_i,
+                _math(nt, (XR + 260, 360), "MULTIPLY", solo_one,
+                      _dot(nt, (XR + 120, 360), d_far, d_far)))
+    var_far = _math(nt, (XR + 680, 360), "SUBTRACT", q_dv,
+                    _math(nt, (XR + 680, 480), "DIVIDE",
+                          _dot(nt, (XR + 560, 480), s_dv, s_dv),
+                          _math(nt, (XR + 560, 600), "MAXIMUM", n_solo, ONE)))
+    # relative threshold, so the test keeps working for meshes far from the
+    # origin or very small (an absolute epsilon would not be scale invariant)
+    var_thr = _math(nt, (XR + 680, 540), "MULTIPLY", q_dv,
+                    _val(nt, (XR + 560, 660), 1e-6))
+    trig_b = _bool(nt, (XR + 900, 160), "AND", solo_f,
+                   _bool(nt, (XR + 900, 40), "AND",
+                         _cmp(nt, (XR + 700, 40), "FLOAT", "GREATER_THAN",
+                              n_solo, vs1_5),
+                         _cmp(nt, (XR + 700, 540), "FLOAT", "LESS_THAN",
+                              var_far, var_thr)))
 
-    other_pos = _sw(nt, (XR + 840, 360), "VECTOR", trig_p, false=pv_n, true=pv_p)
-    rail_c = _sw(nt, (XR + 1060, 360), "VECTOR", trig_b, false=VZERO,
-                 true=_normv(nt, (XR + 1060, 460),
-                             _vm(nt, (XR + 950, 460), "SUBTRACT", other_pos, pv)))
-    RAIL_S_v = _acc(nt, (XR + 1280, 360), "CORNER", "FLOAT_VECTOR", vert_i, rail_c)
-    RAIL_N_v = _acc(nt, (XR + 1280, 540), "CORNER", "FLOAT", vert_i,
-                    _sw(nt, (XR + 1060, 540), "FLOAT", trig_b, false=ZERO, true=ONE))
+    rail_c = _sw(nt, (XR + 1100, 360), "VECTOR", trig_b, false=VZERO,
+                 true=_normv(nt, (XR + 1100, 460), d_far))
+    RAIL_S_v = _acc(nt, (XR + 1320, 360), "CORNER", "FLOAT_VECTOR", vert_i, rail_c)
+    RAIL_N_v = _acc(nt, (XR + 1320, 540), "CORNER", "FLOAT", vert_i,
+                    _sw(nt, (XR + 1100, 540), "FLOAT", trig_b, false=ZERO, true=ONE))
 
-    RAIL_S = pt((XR + 1500, 360), "FLOAT_VECTOR", RAIL_S_v)
-    RAIL_N = pt((XR + 1500, 540), "FLOAT", RAIL_N_v)
-    rail_on = _cmp(nt, (XR + 1700, 540), "FLOAT", "GREATER_THAN", RAIL_N, h0)
-    rail_dir = _normv(nt, (XR + 1700, 360), RAIL_S)
-    rd_c = _fai(nt, (XR + 1900, 360), "POINT", "FLOAT_VECTOR", rail_dir, vert_i)
+    RAIL_S = pt((XR + 1540, 360), "FLOAT_VECTOR", RAIL_S_v)
+    RAIL_N = pt((XR + 1540, 540), "FLOAT", RAIL_N_v)
+    rail_on = _cmp(nt, (XR + 1740, 540), "FLOAT", "GREATER_THAN", RAIL_N, h0)
+    rail_dir = _normv(nt, (XR + 1740, 360), RAIL_S)
+    rd_c = _fai(nt, (XR + 1940, 360), "POINT", "FLOAT_VECTOR", rail_dir, vert_i)
 
-    # even offset with two tagged edges needs min(|t.no_a|, |t.no_b|), and with
-    # a pair that is min(a, sum - a).
+    # `even` scales by the larger of the two edge angles: bmesh compares
+    # |tvec - no|^2 (== 2 - 2*dot for unit vectors) and keeps the bigger one,
+    # so the pick is the edge with the smaller *signed* dot.  Taken together
+    # with `min(a, sum - a)` that is the minimum signed dot of the two tagged
+    # edges.
     #
     # The corner domain registers a tagged edge at the corner that *starts* it,
     # so at a vertex whose two tagged edges are not consecutive in the same
     # face loop the second one only shows up as `contrib_prev` of another
     # corner.  It must be measured against the tangent of *its own* edge
     # (`no_prev`), exactly like S_v / L_v do above.
-    adot_t = _math(nt, (XR + 1900, 180), "ABSOLUTE",
-                   _dot(nt, (XR + 1800, 180), rd_c, no_this))
-    adot_p = _math(nt, (XR + 1900, 300), "ABSOLUTE",
-                   _dot(nt, (XR + 1800, 300), rd_c, no_prev))
-    adot_v = _math(nt, (XR + 2100, 180), "ADD",
-                   _math(nt, (XR + 2050, 120), "MULTIPLY", adot_t, contrib),
-                   _math(nt, (XR + 2050, 240), "MULTIPLY", adot_p, contrib_pf))
-    sum_adot_v = _acc(nt, (XR + 2300, 180), "CORNER", "FLOAT", vert_i, adot_v)
-    sum_adot_c = _fai(nt, (XR + 2500, 180), "POINT", "FLOAT",
-                      pt((XR + 2500, 100), "FLOAT", sum_adot_v), vert_i)
-    mn = _math(nt, (XR + 2720, 180), "MINIMUM", adot_v,
-               _math(nt, (XR + 2600, 100), "SUBTRACT", sum_adot_c, adot_v))
-    mn_total_v = _acc(nt, (XR + 2920, 180), "CORNER", "FLOAT", vert_i, mn)
-    min_adot = _math(nt, (XR + 3140, 180), "DIVIDE",
-                     pt((XR + 3040, 180), "FLOAT", mn_total_v),
-                     _math(nt, (XR + 3040, 100), "MAXIMUM", C, EPS))
+    marked_f = _cmp(nt, (XR + 1940, 60), "FLOAT", "GREATER_THAN", contrib_any, h0)
+    dot_t = _dot(nt, (XR + 1940, 180), rd_c, no_this)
+    dot_p = _dot(nt, (XR + 1940, 300), rd_c, no_prev)
+    adot_v = _math(nt, (XR + 2140, 180), "ADD",
+                   _math(nt, (XR + 2090, 120), "MULTIPLY", dot_t, contrib),
+                   _math(nt, (XR + 2090, 240), "MULTIPLY", dot_p, contrib_pf))
+    sum_adot_v = _acc(nt, (XR + 2340, 180), "CORNER", "FLOAT", vert_i, adot_v)
+    # corner-domain consumer -> use the accumulate output directly (see above)
+    sum_adot_c = sum_adot_v
+    mn = _math(nt, (XR + 2760, 180), "MINIMUM", adot_v,
+               _math(nt, (XR + 2640, 100), "SUBTRACT", sum_adot_c, adot_v))
+    # only the corners that own one of the tagged edges may vote (their count
+    # is C, which the division below normalises by)
+    mn = _sw(nt, (XR + 2840, 180), "FLOAT", marked_f, false=ZERO, true=mn)
+    mn_total_v = _acc(nt, (XR + 3040, 180), "CORNER", "FLOAT", vert_i, mn)
+    min_adot = _math(nt, (XR + 3260, 180), "ABSOLUTE",
+                     _math(nt, (XR + 3260, 100), "DIVIDE",
+                           pt((XR + 3160, 180), "FLOAT", mn_total_v),
+                           _math(nt, (XR + 3160, 100), "MAXIMUM", C, ONE)))
     # shell_v3v3_normalized_to_dist(): |dot| < SMALL_NUMBER -> 1.0 else 1/|dot|
     # (ref/math_geom_inline.cc:133).  A plain MAXIMUM(min_adot, EPS) clamp would
     # invert the *other* way round and blow the reciprocal up to ~1e8.
-    scale_rail = _sw(nt, (XR + 3340, 180), "FLOAT",
-                     _cmp(nt, (XR + 3240, 100), "FLOAT", "LESS_THAN", min_adot, EPS),
-                     false=_math(nt, (XR + 3340, 260), "DIVIDE", ONE,
-                                 _math(nt, (XR + 3340, 340), "MAXIMUM", min_adot, EPS)),
+    scale_rail = _sw(nt, (XR + 3460, 180), "FLOAT",
+                     _cmp(nt, (XR + 3360, 100), "FLOAT", "LESS_THAN", min_adot, EPS),
+                     false=_math(nt, (XR + 3460, 260), "DIVIDE", ONE,
+                                 _math(nt, (XR + 3460, 340), "MAXIMUM", min_adot, EPS)),
                      true=ONE)
-    even_scale = _sw(nt, (XR + 3540, 180), "FLOAT", EVEN, false=ONE, true=scale_rail)
-    rail_tvec = _scale(nt, (XR + 3740, 180), rail_dir, even_scale)
-    use_rail = _bool(nt, (XR + 3740, 60), "AND", ERAIL, rail_on)
-    tvec = _sw(nt, (XR + 3960, 60), "VECTOR", use_rail,
+    even_scale = _sw(nt, (XR + 3660, 180), "FLOAT", EVEN, false=ONE, true=scale_rail)
+    rail_tvec = _scale(nt, (XR + 3860, 180), rail_dir, even_scale)
+    use_rail = _bool(nt, (XR + 3860, 60), "AND", ERAIL, rail_on)
+    tvec = _sw(nt, (XR + 4080, 60), "VECTOR", use_rail,
                false=tvec_plain, true=rail_tvec)
 
     relT = _sw(nt, (X + 200, 340), "FLOAT", C_ge2,
@@ -586,7 +636,6 @@ def build(group_name=GROUP_NAME):
     g0 = _store(nt, (X, -140), g0, PFX + "dorig", "FLOAT_VECTOR", "POINT", DISP_ORIG)
     g0 = _store(nt, (X, -280), g0, PFX + "issel", "FLOAT", "POINT", SELOUT)
     g0 = _store(nt, (X, -420), g0, PFX + "c", "FLOAT", "POINT", C)
-
 
     ex = _n(nt, "GeometryNodeExtrudeMesh", (X + 300, -140))
     ex.inputs["Offset Scale"].default_value = 0.0
