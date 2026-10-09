@@ -196,11 +196,28 @@ def _one(nt, loc):
 
 # ------------------------------------------------------------------ build
 GROUP_NAME = "Inset Faces"
+# bump together with bl_info["version"]; a group carrying a different tag
+# was built by an older release and gets rebuilt in place on next use.
+VERSION = (0, 1, 2)
+_VER_KEY = "bi1mcs_version"
 
 
-def build(group_name=GROUP_NAME):
-    """Create the "Inset Faces" geometry-node group and return it."""
-    nt = bpy.data.node_groups.new(group_name, "GeometryNodeTree")
+def build(group_name=GROUP_NAME, nt=None):
+    """Create the "Inset Faces" geometry-node group and return it.
+
+    Pass an existing tree as *nt* to rebuild it in place: the group keeps its
+    identity, so every modifier that already points at it keeps working
+    instead of being orphaned by a fresh group of the same name.
+    """
+    if nt is None:
+        nt = bpy.data.node_groups.new(group_name, "GeometryNodeTree")
+    else:
+        nt.nodes.clear()
+        try:
+            nt.interface.clear()
+        except AttributeError:
+            for _it in list(nt.interface.items_tree):
+                nt.interface.remove(_it)
 
     s = nt.interface.new_socket
     s(name="Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
@@ -327,11 +344,10 @@ def build(group_name=GROUP_NAME):
     tag_e = _bool(nt, (X + 480, 780), "OR", mixed,
                   _bool(nt, (X + 400, 900), "AND", use_bnd, bndreg))
 
-    # A face only takes part when at least one of its edges got tagged.
-    # (bmesh: with edge_info_len == 0 every following loop is a no-op, so the
-    #  mesh is returned completely untouched - this must not extrude anything.)
+    # Per-face accumulate, kept for the global "does this mesh hold any tagged
+    # edge at all" flag below (bmesh: with edge_info_len == 0 every following
+    # loop is a no-op, so the mesh must come back completely untouched).
     tagff = _sw(nt, (X + 700, 780), "FLOAT", tag_e, false=ZERO, true=ONE)
-    tagf_n = _acc(nt, (X + 900, 780), "CORNER", "FLOAT", face_i, tagff)
     # global "the mesh holds at least one tagged edge" flag, used by depth /
     # relative-offset (the lazy length fallback of bmo_inset.cc stays zero when
     # no edge was tagged at all).
@@ -340,9 +356,6 @@ def build(group_name=GROUP_NAME):
     cof = _n(nt, "GeometryNodeCornersOfFace", (X + 900, 940))
     _l(nt, px, cof.inputs["Face Index"])
     anyf_c = cof.outputs["Corner Index"]
-    face_tagged = _cmp(nt, (X + 1300, 780), "FLOAT", "GREATER_THAN",
-                       _fai(nt, (X + 1300, 880), "CORNER", "FLOAT", tagf_n, anyf_c),
-                       _val(nt, (X + 1100, 1000), 0.5))
     X += 700
     contrib = _sw(nt, (X, 780), "FLOAT",
                   _bool(nt, (X - 200, 700), "AND", tag_e, reg_c), false=ZERO, true=ONE)
@@ -627,10 +640,28 @@ def build(group_name=GROUP_NAME):
 
     # ---------------- extrude ---------------------------------------------
     X += 1500
+    # bmesh re-hooks the loop of *every selected* face at a split vertex, not
+    # only the ones carrying a tagged edge (bmo_inset.cc 867/1094: the vertex is
+    # separated first, then each selected fan is displaced).  A selected face can
+    # reach a tagged vertex through two *untagged* edges - the folded "needle"
+    # corner produced by a V-notch / spike pushed into an edge.  Such a face
+    # carries no tagged edge of its own, but the operator still moves it, so it
+    # has to join the extruded region.  Leaving it out welds it to the old
+    # vertex and lets the walls along its two untagged edges survive as stray
+    # triangles (visible as a flap hanging off the notch).
+    # Provably safe to widen: both endpoints of a tagged edge have C > 0, so
+    # after the widening every remaining region-boundary edge has C == 0 at both
+    # ends and its wall degenerates away in the weld pass below.
+    cvt = _sw(nt, (X - 1400, 160), "FLOAT",
+              _fai(nt, (X - 1600, 160), "POINT", "BOOLEAN", C_gt0, vert_i),
+              false=ZERO, true=ONE)
+    vtf_n = _acc(nt, (X - 1100, 160), "CORNER", "FLOAT", face_i, cvt)
+    face_vtagged = _cmp(nt, (X - 800, 200), "FLOAT", "GREATER_THAN",
+                        _fai(nt, (X - 800, 100), "CORNER", "FLOAT", vtf_n, anyf_c), h0f)
     # Individual mode insets every selected face on its own (Boundary / Outset
-    # do not apply there), otherwise only faces carrying a tagged edge.
+    # do not apply there), otherwise only faces touching a tagged vertex.
     ex_sel = _sw(nt, (X, 260), "BOOLEAN", IND,
-                 false=_bool(nt, (X - 100, 160), "AND", reg_face, face_tagged),
+                 false=_bool(nt, (X - 100, 160), "AND", reg_face, face_vtagged),
                  true=SEL)
     g0 = _store(nt, (X, 0), geo, PFX + "dtop", "FLOAT_VECTOR", "POINT", DISP_TOP)
     g0 = _store(nt, (X, -140), g0, PFX + "dorig", "FLOAT_VECTOR", "POINT", DISP_ORIG)
@@ -730,14 +761,20 @@ def build(group_name=GROUP_NAME):
 
 
 def get_or_create_group(name=GROUP_NAME):
-    """Return the shared "Inset Faces" group, building it on first use.
+    """Return the shared "Inset Faces" group, building or refreshing it.
 
-    Rebuilds the group when it was saved by an incompatible version (the node
-    layout changed between releases).
+    A group saved by an older release has a different node layout, so it is
+    rebuilt *in place* (same node-group ID) - that way the modifiers already
+    using it pick the new graph up instead of being left on the old one.
     """
+    tag = "%d.%d.%d" % VERSION
     ng = bpy.data.node_groups.get(name)
-    if ng is not None and ng.bl_idname == "GeometryNodeTree":
-        return ng
-    if ng is not None:                       # wrong ID type -> replace it
-        bpy.data.node_groups.remove(ng)
-    return build(name)
+    if ng is not None and ng.bl_idname != "GeometryNodeTree":
+        bpy.data.node_groups.remove(ng)      # wrong ID type -> replace it
+        ng = None
+    if ng is None:
+        ng = build(name)
+    elif ng.get(_VER_KEY) != tag:
+        build(name, ng)
+    ng[_VER_KEY] = tag
+    return ng
