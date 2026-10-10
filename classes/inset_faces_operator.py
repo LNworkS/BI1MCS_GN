@@ -3,6 +3,7 @@
 
 Adds a `BI1MCS` sub-menu to the node editor's ``Add`` menu (``NODE_MT_add``)
 containing the single entry ``Inset Faces``, which inserts the node group.
+Other modules append their entries to ``MENU_ENTRIES`` (see ``__init__.py``).
 """
 import bpy
 
@@ -10,6 +11,12 @@ from ..ngs.inset_faces import (GROUP_NAME, MIN_BLENDER, get_or_create_group,
                                is_supported)
 
 MENU_IDNAME = "NODE_MT_bi1mcs"
+
+# (bl_idname, label) pairs drawn in the sub-menu; filled by ``__init__.register``
+MENU_ENTRIES = []
+
+# this module's contribution to the sub-menu
+menu_entry = ("node.bi1mcs_inset_faces", GROUP_NAME)
 
 
 def _node_editor(context):
@@ -21,15 +28,15 @@ def _node_editor(context):
     return space
 
 
-def insert_group_node(tree, space=None, group=None):
-    """Insert (=Add) the Inset Faces group node into *tree* and return it."""
+def insert_group_node(tree, space=None, group=None, label=None):
+    """Insert (=Add) *group* into *tree* and return the new node."""
     group = group or get_or_create_group()
     for node in tree.nodes:
         node.select = False
 
     node = tree.nodes.new("GeometryNodeGroup")
     node.node_tree = group
-    node.label = GROUP_NAME
+    node.label = label or GROUP_NAME
     node.select = True
     tree.nodes.active = node
 
@@ -81,8 +88,8 @@ class NODE_MT_bi1mcs(bpy.types.Menu):
 
     def draw(self, context):
         layout = self.layout
-        layout.operator(NODE_OT_bi1mcs_inset_faces.bl_idname,
-                        text=GROUP_NAME)
+        for idname, label in MENU_ENTRIES:
+            layout.operator(idname, text=label)
 
 
 def draw_bi1mcs_menu(self, context):
