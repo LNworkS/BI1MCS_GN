@@ -37,10 +37,10 @@ Not exposed, and why
 Deliberate approximations - all marked in the socket descriptions
 -----------------------------------------------------------------
 ==========================  ==================================================
-``Miter``                   The native kernel has a single boolean flag.  It
-                            reproduces the modifier's (Sharp, Sharp) and
-                            (Patch, Arc) states exactly; the other four
-                            combinations are approximated.  See below.
+``Miter``                   ``Miter Outer = Arc`` has no separate setting in
+                            the native kernel; the other five combinations are
+                            reproduced (two of them approximately).  See
+                            "Miter mapping" below.
 ``Width Method: Percent``   bmesh measures the percentage along the *adjacent*
                             edges; here a percentage of the beveled edge's own
                             length is used.
@@ -63,30 +63,73 @@ reports this separately as the "kernel baseline".
 
 Miter mapping
 -------------
-``bmesh_bevel.cc:3548`` only applies ``Miter Outer`` when three or more
-beveled edges meet *and* the corner is reflex, so a cube never shows it.  On
-a reflex test corpus the modifier produces six distinct results while the
-native flag produces two:
+The modifier exposes ``Miter Outer`` (3 states) and ``Miter Inner`` (2 states),
+and all six combinations give distinct geometry.  The native node has a single
+``Miter`` boolean - but, unlike the modifier's own flag, it is a *per-vertex*
+field: switching it on at a single vertex only changes that vertex's corner
+(measured on an L-prism: 36 -> 39 vertices, and switching a single *edge* on
+changes nothing at all).  Since ``miter_outer`` fires only at reflex corners and
+``miter_inner`` only at convex ones (``bmesh_bevel.cc:3548`` +
+``edges_angle_kind``), the flag can be built per vertex so that the two sides
+are driven independently:
 
-===============  =============  ==========================================
-native flag      == modifier    reachable
-===============  =============  ==========================================
-off              (Sharp, Sharp) yes
-on               (Patch, Arc)   yes
-===============  =============  ==========================================
+* reflex vertex  ->  ``Miter Outer != Sharp``
+* convex vertex  ->  ``Miter Inner == Arc``
 
-The rule used here is "either side asks for a miter": the flag is turned on
-when ``Miter Inner == Arc`` **or** ``Miter Outer != Sharp``.  That keeps the
-inner arc (the visually dominant half - it adds ~34 vertices on a reflex prism
-against the outer's 4) and lets ``Miter Outer`` affect the result as the
-modifier does, at the cost of the outer pattern always coming out as Patch.
+A vertex counts as reflex when one of its edges is concave, which the
+``Edge Angle`` node reports through its signed output (negative on a concave
+edge); the results are accumulated per vertex.
+
+Measured on an L-prism (12 vertices, two reflex corners, segments 1):
+
+===========================  ============  ============
+combination                  modifier      node
+===========================  ============  ============
+(Sharp, Sharp)               36 v          36 v   exact
+(Sharp, Arc)                 70 v          71 v
+(Patch, Sharp)               40 v          39 v
+(Patch, Arc)                 74 v          74 v   exact
+(Arc,   Sharp)               38 v          39 v
+(Arc,   Arc)                 72 v          74 v
+===========================  ============  ============
+
+So the two sides really do move independently - four distinct results, and
+``Miter Outer`` is no longer inert - but only two of the six combinations land
+on the modifier's geometry exactly.  The other four differ by one or two
+vertices at the reflex corners: the modifier's arc miter at a convex corner
+reaches *into* a neighbouring reflex corner and inserts an extra ring there,
+which the native kernel never does.  ``Miter Outer = Arc`` has no setting of its
+own either - the native kernel fills a reflex corner the same way for Patch and
+Arc - so the outer side is two-valued (Sharp / filled) and ``Arc`` behaves like
+``Patch``.
+
+Searched, and ruled out
+-----------------------
+An exhaustive search over per-vertex flag patterns (every constant-per-class
+assignment over reflex / adjacent / far vertices, ``probe_bevel_miter8.py``)
+found no pattern that reproduces any of the four mixed combinations, and only
+``(Sharp, Sharp)`` and ``(Patch, Arc)`` were ever reached exactly.
+
+Getting the other four by combining two bevels was measured and does not work:
+
+* two bevels over a partition of the edge set give 42 faces instead of 38 on an
+  L-prism (segments 1): a vertex whose edges are split across the two passes
+  never sees its full bevel, so the miter is not formed at all;
+* swapping the reflex-corner neighbourhood between the flag=on and flag=off
+  results leaves a seam - 76 vertices instead of 70 even welded at distance
+  0.1 - because every bevel strip is shaped by *both* of its end corners, so
+  there is no cut where the two runs agree.
+
+On a mesh with no concave edges (a cube, or the great majority of assets) every
+vertex is convex, so ``Miter Outer`` is inert and all six combinations come out
+exactly as the modifier draws them - which is what the modifier does there too.
 """
 
 import bpy
 
 MIN_BLENDER = (5, 2, 0)
 GROUP_NAME = "Bevel"
-VERSION = (0, 2, 0)
+VERSION = (0, 4, 0)
 _VER_KEY = "bi1mcs_version"
 
 # ---------------------------------------------------------------- enum tables
@@ -324,20 +367,23 @@ def build(group_name=GROUP_NAME, nt=None):
 
     s(name="Miter Outer", in_out="INPUT", socket_type="NodeSocketInt",
       description=_enum_desc(
-          "Miters where the bevel meets at a reflex (concave) corner",
+          "Pattern for miters at reflex (concave) corners",
           MITER_OUTER,
-          "Only fires where three or more beveled edges meet; a convex shape "
-          "such as a cube never uses it.\n"
-          "The native kernel has one miter flag with two states: off == "
-          "(Sharp, Sharp) and on == (Patch, Arc).  Any value other than Sharp "
-          "turns it on, so Patch and Arc both give the kernel's Patch "
-          "pattern."))
+          "Driven independently of Miter Inner: the native Miter flag is a\n"
+          "per-vertex field, so it is switched on exactly at the reflex\n"
+          "vertices.  A reflex vertex is one with a concave edge - a convex\n"
+          "shape such as a cube has none, and the modifier ignores this input\n"
+          "there too.  The native kernel has no separate Arc fill, so Arc\n"
+          "behaves like Patch; everything else follows the modifier."))
     s(name="Miter Inner", in_out="INPUT", socket_type="NodeSocketInt",
       description=_enum_desc(
-          "Miters where the bevel meets at a convex corner",
+          "Pattern for miters at convex corners",
           MITER_INNER,
-          "Arc turns the native kernel's miter flag on (the kernel's on-state "
-          "is exactly the modifier's (Patch, Arc) pair)."))
+          "Driven independently of Miter Outer: the native Miter flag is a\n"
+          "per-vertex field, so it is switched on exactly at the convex\n"
+          "vertices.  Arc is the kernel's miter fill and Sharp turns it off.\n"
+          "On a mesh without concave edges this reproduces all six modifier\n"
+          "combinations exactly."))
     spr = s(name="Spread", in_out="INPUT", socket_type="NodeSocketFloat",
             description="Spread distance for arc miters")
     spr.default_value = 0.1
@@ -366,6 +412,8 @@ def build(group_name=GROUP_NAME, nt=None):
     VW = o["Vertex Weight"]
     VG = o["Vertex Group"]
     VGINV = o["Invert Vertex Group"]
+    # `Miter Outer` / `Miter Inner` drive the native flag per vertex - see
+    # "Miter mapping" in the module docstring.
     MO = o["Miter Outer"]
     MI = o["Miter Inner"]
     SPR = o["Spread"]
@@ -507,14 +555,51 @@ def build(group_name=GROUP_NAME, nt=None):
 
     OFF = [convert(AMT[i], 400 - 800 * i) for i in range(4)]
 
+    # ------------------------------------------------------- reflex corners
+    # `miter_outer` only fires at reflex (concave) corners and `miter_inner`
+    # only at convex ones, and the native node's `Miter` input is a *per-vertex*
+    # field (measured: switching it on at one vertex only changes that vertex's
+    # corner, while switching a single edge on does nothing).  The two sides can
+    # therefore be driven independently by building the flag per vertex:
+    #
+    #     flag(v) = reflex(v) ? (Miter Outer != Sharp) : (Miter Inner == Arc)
+    #
+    # A vertex is reflex when one of its edges is concave; the edge angle node's
+    # signed output is negative on a concave edge.  The count is accumulated
+    # over the *corners* of the vertex - one per incident face, and each corner
+    # has its own outgoing edge - because a plain ``Edges of Vertex`` lookup
+    # collapses to its first element (measured: it reports degree 1).
+    X += 1400
+    idx = _n(nt, "GeometryNodeInputIndex", (X, -1900)).outputs["Index"]
+    sang = _n(nt, "GeometryNodeInputMeshEdgeAngle", (X, -1300)).outputs[
+        "Signed Angle"]
+    concave = _cmp(nt, (X + 200, -1300), "FLOAT", "LESS_THAN", sang, -1e-6)
+    cei = _n(nt, "GeometryNodeEdgesOfCorner", (X, -1500)).outputs[
+        "Next Edge Index"]
+    chit = _fai(nt, (X + 220, -1500), "EDGE", "BOOLEAN", concave, cei)
+    cval = _sw(nt, (X + 440, -1500), "INT", chit, false=0, true=1)
+    cvin = _n(nt, "GeometryNodeVertexOfCorner", (X, -1700)).outputs[
+        "Vertex Index"]
+    acc = _n(nt, "GeometryNodeAccumulateField", (X + 660, -1500),
+             data_type="INT", domain="CORNER")
+    _l(nt, cval, acc.inputs["Value"])
+    _l(nt, cvin, acc.inputs["Group ID"])
+    cov = _n(nt, "GeometryNodeCornersOfVertex", (X, -2100))
+    _l(nt, idx, cov.inputs["Vertex Index"])
+    tot = _fai(nt, (X + 880, -1500), "CORNER", "INT", acc.outputs["Total"],
+               cov.outputs["Corner Index"])
+    reflex = _cmp(nt, (X + 1100, -1500), "INT", "GREATER_THAN", tot, 0)
+
     # -------------------------------------------------------------- miter
-    # "Either side asks for a miter".  The native kernel has a single flag with
-    # two states - off == (Sharp, Sharp), on == (Patch, Arc) - so the outer
-    # pattern always comes out as the kernel's Patch; everything else about the
-    # four reachable-modifier combinations is documented on the sockets.
-    miter = _or(nt, (X + 1300, -1200),
-                _eq_i(nt, (X + 1100, -1120), MI, 1),      # Miter Inner = Arc
-                _ge_i(nt, (X + 1100, -1280), MO, 1))      # Miter Outer != Sharp
+    # `Miter Outer` has no Arc setting of its own - the native kernel fills a
+    # reflex corner the same way whichever state is asked for - so the outer
+    # side is two-valued (Sharp / filled).  The other five combinations follow
+    # the modifier; the two mixed ones are close but not identical, see "Miter
+    # mapping" in the module docstring.
+    outer_on = _cmp(nt, (X + 1100, -1700), "INT", "NOT_EQUAL", MO, 0)
+    inner_on = _eq_i(nt, (X + 1100, -1900), MI, 1)     # Miter Inner = Arc
+    miter = _sw(nt, (X + 1320, -1800), "BOOLEAN", reflex,
+                false=inner_on, true=outer_on)
 
     # ------------------------------------------------------------- bevel(s)
     X += 1800
