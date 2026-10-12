@@ -19,8 +19,8 @@ class NODE_OT_bi1mcs_bevel(bpy.types.Operator):
     bl_idname = "node.bi1mcs_bevel"
     bl_label = GROUP_NAME
     bl_description = ("Bevel - Geometry-Nodes port of the Bevel modifier "
-                      "(Width Method / Segments / Profile / Limit Method / "
-                      "Affect / Miter / Mark Seam & Sharp / Face Strength)")
+                      "(four offsets / Width Method / Segments / Profile / "
+                      "Limit Method / Affect / Miter)")
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod

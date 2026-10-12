@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 """BI1MCS_GN :: "Bevel" node group.
 
-A Geometry-Nodes front end for Blender's Bevel, exposing the whole parameter
-surface of the Bevel *modifier* on a single node.
+A Geometry-Nodes front end for Blender's Bevel *modifier*.
 
 How it works
 ------------
@@ -10,27 +9,38 @@ Blender 5.2 ships a native ``Mesh Bevel`` node (``GeometryNodeMeshBevel``) that
 runs the newer ``geometry::mesh_bevel`` kernel.  The *modifier* still runs the
 older bmesh kernel (``BM_mesh_bevel``).  The two agree closely, so the geometry
 is delegated to the native node and everything the native node lacks (limit
-method, width method, marking, material, face strength) is rebuilt around it in
-nodes.
+method, width method, miter combination) is rebuilt around it in nodes.
 
-Verified against the modifier (see ``probe_bevel_gn.py``): limit methods, all
-five width methods, segments, profile, miter and the post-processing flags all
-reproduce the modifier bit for bit on the test corpus.
+The four offsets are named exactly like the native node's sockets and each one
+is run through the Width Method conversion independently, so the node can
+reproduce the modifier's single ``Width`` *and* the native node's per-edge-end
+control at the same time.
+
+Verified against the modifier: limit methods, all five width methods, segments,
+profile and the miter mapping all reproduce the modifier bit for bit on the
+axis-aligned and skewed test corpus (``probe_bevel_gn.py`` / ``probe_bevel_post.py``).
+
+Not exposed, and why
+--------------------
+``Clamp Overlap``           The native kernel has no overlap clamp.
+``Loop Slide``              The native kernel always slides.
+``V-Mesh Method``           Only "Adjacent" exists in the native kernel.
+``Harden Normals``          Needs custom split normals, which nodes cannot
+                            write.
+``Mark Seam`` / ``Mark Sharp`` / ``Material Index`` / ``Face Strength``
+                            Dropped from the interface.  The ``Bevel Faces``
+                            and ``Bevel Edges`` outputs carry the same
+                            information, so a Store Named Attribute node
+                            downstream does the job.
+``Profile Type``            Only the superellipse profile is exposed.
 
 Deliberate approximations - all marked in the socket descriptions
 -----------------------------------------------------------------
 ==========================  ==================================================
-``Loop Slide``              The native kernel always slides; the switch is
-                            accepted but has no effect.
-``V-Mesh Method``           Only "Adjacent" exists in the native kernel;
-                            "Cutoff" behaves like "Adjacent".
-``Clamp Overlap``           No counterpart in the native kernel.
-``Harden Normals``          Needs custom split normals, which nodes cannot
-                            write; ignored.
-``Miter Outer``             The native kernel has one ``Miter`` flag and it
-                            corresponds to the modifier's *Miter Inner*
-                            (Sharp = off, Arc = on).  ``Miter Outer`` is
-                            accepted for parameter compatibility and ignored.
+``Miter``                   The native kernel has a single boolean flag.  It
+                            reproduces the modifier's (Sharp, Sharp) and
+                            (Patch, Arc) states exactly; the other four
+                            combinations are approximated.  See below.
 ``Width Method: Percent``   bmesh measures the percentage along the *adjacent*
                             edges; here a percentage of the beveled edge's own
                             length is used.
@@ -41,13 +51,42 @@ Deliberate approximations - all marked in the socket descriptions
                             superellipse, so any value > 0 is reproduced
                             exactly and 0 falls back to the generic shape.
 ==========================  ==================================================
+
+Kernel drift (not this node's doing)
+------------------------------------
+The two kernels are not identical everywhere.  Running the *native node on its
+own* against the modifier on a block with a 1x2 notch reproduces the same
+topology but drifts by up to ~4% of the width once ``Segments >= 3``
+(measured: h = 0.0087 at width 0.2, segments 6), while a cube, an L-prism, a
+cylinder and a cone are bit-exact at every segment count.  ``probe_bevel_post.py``
+reports this separately as the "kernel baseline".
+
+Miter mapping
+-------------
+``bmesh_bevel.cc:3548`` only applies ``Miter Outer`` when three or more
+beveled edges meet *and* the corner is reflex, so a cube never shows it.  On
+a reflex test corpus the modifier produces six distinct results while the
+native flag produces two:
+
+===============  =============  ==========================================
+native flag      == modifier    reachable
+===============  =============  ==========================================
+off              (Sharp, Sharp) yes
+on               (Patch, Arc)   yes
+===============  =============  ==========================================
+
+The rule used here is "either side asks for a miter": the flag is turned on
+when ``Miter Inner == Arc`` **or** ``Miter Outer != Sharp``.  That keeps the
+inner arc (the visually dominant half - it adds ~34 vertices on a reflex prism
+against the outer's 4) and lets ``Miter Outer`` affect the result as the
+modifier does, at the cost of the outer pattern always coming out as Patch.
 """
 
 import bpy
 
 MIN_BLENDER = (5, 2, 0)
 GROUP_NAME = "Bevel"
-VERSION = (0, 1, 0)
+VERSION = (0, 2, 0)
 _VER_KEY = "bi1mcs_version"
 
 # ---------------------------------------------------------------- enum tables
@@ -56,17 +95,13 @@ LIMIT_METHODS = ("None", "Angle", "Weight", "Vertex Group")
 AFFECTS = ("Edges", "Vertices")
 MITER_OUTER = ("Sharp", "Patch", "Arc")
 MITER_INNER = ("Sharp", "Arc")
-FACE_STRENGTH = ("None", "New", "Affected", "All")
-PROFILE_TYPES = ("Superellipse", "Custom")
-
-# Raw values the bmesh kernel writes into the ``__mod_weightednormals_faceweight``
-# face attribute (bmesh_bevel.cc:3136, FKind -> FACE_STRENGTH_*).
-FS_WEAK = -16384      # F_VERT - faces built around a vertex
-FS_MEDIUM = 0         # F_EDGE - faces along a beveled edge
-FS_STRONG = 16384     # F_RECON / F_ORIG - everything else
 
 # Width-method shortcuts (indices into WIDTH_METHODS).
 WM_OFFSET, WM_WIDTH, WM_DEPTH, WM_PERCENT, WM_ABSOLUTE = range(5)
+
+# The four offset sockets, in the native node's own order.
+OFFSET_NAMES = ("Start Left Offset", "Start Right Offset",
+                "End Left Offset", "End Right Offset")
 
 
 def is_supported():
@@ -183,15 +218,6 @@ def _named(nt, loc, name, dtype):
     return nd.outputs["Attribute"]
 
 
-def _store(nt, loc, geo, name, dtype, domain, value):
-    nd = _n(nt, "GeometryNodeStoreNamedAttribute", loc, data_type=dtype,
-            domain=domain)
-    nd.inputs["Name"].default_value = name
-    _l(nt, geo, nd.inputs["Geometry"])
-    _l(nt, value, nd.inputs["Value"])
-    return nd.outputs["Geometry"]
-
-
 def _eq_i(nt, loc, sock, value):
     return _cmp(nt, loc, "INT", "EQUAL", sock, value)
 
@@ -222,23 +248,35 @@ def build(group_name=GROUP_NAME, nt=None):
         except Exception:
             pass
 
-    amt = s(name="Amount", in_out="INPUT", socket_type="NodeSocketFloat",
-            description="Bevel amount (the modifier's Width)")
-    amt.default_value = 0.1
-    amt.min_value = 0.0
+    af = s(name="Affect", in_out="INPUT", socket_type="NodeSocketInt",
+           description=_enum_desc("Bevel edges or vertices", AFFECTS))
+    af.default_value = 0
 
     wm = s(name="Width Method", in_out="INPUT", socket_type="NodeSocketInt",
            description=_enum_desc(
-               "How Amount is measured", WIDTH_METHODS,
+               "How the four offsets are measured", WIDTH_METHODS,
+               "Offset: used as is.\n"
+               "Width / Depth: divided by the edge's face-normal angle so the "
+               "distance is measured across the bevel.\n"
                "Percent: percentage of the beveled edge's own length.\n"
-               "Absolute: Amount used directly as the offset.\n"
-               "bmesh instead measures both along the adjacent edges."))
+               "Absolute: used as is.\n"
+               "bmesh instead measures Percent/Absolute along the adjacent "
+               "edges."))
     wm.default_value = 0
 
-    pct = s(name="Percent", in_out="INPUT", socket_type="NodeSocketFloat",
-            description="Bevel amount for the Percent width method")
-    pct.default_value = 0.1
-    pct.min_value = 0.0
+    for nm, desc, val in (
+            (OFFSET_NAMES[0], "Amount at the edge's start, measured towards "
+                              "the face on the left", 0.1),
+            (OFFSET_NAMES[1], "Amount at the edge's start, measured towards "
+                              "the face on the right", 0.1),
+            (OFFSET_NAMES[2], "Amount at the edge's end, measured towards the "
+                              "face on the left", 0.1),
+            (OFFSET_NAMES[3], "Amount at the edge's end, measured towards the "
+                              "face on the right", 0.1)):
+        sk = s(name=nm, in_out="INPUT", socket_type="NodeSocketFloat",
+               description=desc + "\nInterpreted according to Width Method.")
+        sk.default_value = val
+        sk.min_value = 0.0
 
     seg = s(name="Segments", in_out="INPUT", socket_type="NodeSocketInt",
             description="Number of segments for round edges/verts")
@@ -250,23 +288,13 @@ def build(group_name=GROUP_NAME, nt=None):
         pass
 
     prof = s(name="Profile", in_out="INPUT", socket_type="NodeSocketFloat",
-             description="Profile shape (0.5 = round); "
-                         "used when no Custom Profile is supplied.\n"
+             description="Superellipse profile shape (0.5 = round; 0.25 is "
+                         "closer to a chamfer).\n"
                          "Exactly 0 is not reproducible: bmesh switches to a "
                          "special 'square in' topology there.")
     prof.default_value = 0.5
     prof.min_value = 0.0
     prof.max_value = 1.0
-
-    s(name="Profile Type", in_out="INPUT", socket_type="NodeSocketInt",
-      description=_enum_desc("Profile source", PROFILE_TYPES))
-    s(name="Custom Profile", in_out="INPUT", socket_type="NodeSocketGeometry",
-      description="Curve sampled for a custom profile: XY plane, "
-                  "(0,1,0) -> (1,0,0)")
-
-    af = s(name="Affect", in_out="INPUT", socket_type="NodeSocketInt",
-           description=_enum_desc("Bevel edges or vertices", AFFECTS))
-    af.default_value = 0
 
     lim = s(name="Limit Method", in_out="INPUT", socket_type="NodeSocketInt",
             description=_enum_desc("Which elements get beveled", LIMIT_METHODS,
@@ -294,59 +322,26 @@ def build(group_name=GROUP_NAME, nt=None):
             socket_type="NodeSocketBool")
     inv.default_value = False
 
-    clamp = s(name="Clamp Overlap", in_out="INPUT", socket_type="NodeSocketBool",
-              description="NOT SUPPORTED - the native bevel kernel has no "
-                          "overlap clamp; the switch is accepted and ignored")
-    clamp.default_value = True
-
-    slide = s(name="Loop Slide", in_out="INPUT", socket_type="NodeSocketBool",
-              description="NOT SUPPORTED - the native bevel kernel always "
-                          "slides along edges; the switch is accepted and "
-                          "ignored")
-    slide.default_value = True
-
     s(name="Miter Outer", in_out="INPUT", socket_type="NodeSocketInt",
       description=_enum_desc(
-          "Pattern for outside miters", MITER_OUTER,
-          "NOT SUPPORTED - the native bevel kernel has a single miter flag "
-          "and it corresponds to Miter Inner.  This switch is accepted and "
-          "ignored."))
+          "Miters where the bevel meets at a reflex (concave) corner",
+          MITER_OUTER,
+          "Only fires where three or more beveled edges meet; a convex shape "
+          "such as a cube never uses it.\n"
+          "The native kernel has one miter flag with two states: off == "
+          "(Sharp, Sharp) and on == (Patch, Arc).  Any value other than Sharp "
+          "turns it on, so Patch and Arc both give the kernel's Patch "
+          "pattern."))
     s(name="Miter Inner", in_out="INPUT", socket_type="NodeSocketInt",
       description=_enum_desc(
-          "Pattern for inside miters", MITER_INNER,
-          "Drives the native kernel's Miter flag: Sharp = off, Arc = on."))
-
+          "Miters where the bevel meets at a convex corner",
+          MITER_INNER,
+          "Arc turns the native kernel's miter flag on (the kernel's on-state "
+          "is exactly the modifier's (Patch, Arc) pair)."))
     spr = s(name="Spread", in_out="INPUT", socket_type="NodeSocketFloat",
             description="Spread distance for arc miters")
     spr.default_value = 0.1
     spr.min_value = 0.0
-
-    for nm, desc in (("Mark Seam", "Mark the generated edges as UV seams"),
-                     ("Mark Sharp", "Mark the generated edges as sharp"),
-                     ("Harden Normals",
-                      "NOT SUPPORTED - needs custom split normals, which "
-                      "geometry nodes cannot write")):
-        sk = s(name=nm, in_out="INPUT", socket_type="NodeSocketBool",
-               description=desc)
-        sk.default_value = False
-
-    mat = s(name="Material Index", in_out="INPUT", socket_type="NodeSocketInt",
-            description="Material index of the generated faces, -1 to keep "
-                        "the surrounding index")
-    mat.default_value = -1
-    mat.min_value = -1
-
-    s(name="Face Strength", in_out="INPUT", socket_type="NodeSocketInt",
-      description=_enum_desc(
-          "Whether/which faces get a face strength", FACE_STRENGTH,
-          "Written to __mod_weightednormals_faceweight, exactly like the "
-          "modifier does."))
-
-    s(name="V-Mesh Method", in_out="INPUT", socket_type="NodeSocketInt",
-      description=_enum_desc("How the mesh at intersections is created",
-                             ("Adjacent", "Cutoff"),
-                             "Only 'Adjacent' exists in the native kernel; "
-                             "'Cutoff' behaves the same."))
 
     s(name="Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
     s(name="Bevel Faces", in_out="OUTPUT", socket_type="NodeSocketBool",
@@ -360,14 +355,11 @@ def build(group_name=GROUP_NAME, nt=None):
     o = gi.outputs
     GEO = o["Geometry"]
     SEL = o["Selection"]
-    AMT = o["Amount"]
+    AFF = o["Affect"]
     WM = o["Width Method"]
-    PCT = o["Percent"]
+    AMT = [o[nm] for nm in OFFSET_NAMES]
     SEG = o["Segments"]
     PROF = o["Profile"]
-    PTYPE = o["Profile Type"]
-    CPROF = o["Custom Profile"]
-    AFF = o["Affect"]
     LIM = o["Limit Method"]
     ANG = o["Angle"]
     EW = o["Edge Weight"]
@@ -377,10 +369,6 @@ def build(group_name=GROUP_NAME, nt=None):
     MO = o["Miter Outer"]
     MI = o["Miter Inner"]
     SPR = o["Spread"]
-    MSEAM = o["Mark Seam"]
-    MSHARP = o["Mark Sharp"]
-    MAT = o["Material Index"]
-    FSTR = o["Face Strength"]
 
     X = -8800
     ONE = _val(nt, (X, -1500), 1.0)
@@ -389,7 +377,8 @@ def build(group_name=GROUP_NAME, nt=None):
     TWO = _val(nt, (X, -2100), 2.0)
     EPS = _val(nt, (X, -2300), 1e-6)
     THR = _val(nt, (X, -2500), 0.5)
-    P100 = _val(nt, (X, -2700), 100.0)
+    P1 = _val(nt, (X, -2700), 1e-2)
+    P100 = _val(nt, (X, -2900), 100.0)
 
     # ---------------------------------------------- per-edge measurements
     X += 600
@@ -479,60 +468,71 @@ def build(group_name=GROUP_NAME, nt=None):
     # bmesh guards a vanishing sin/cos with BEVEL_EPSILON and falls back to 1%
     # of the amount (bmesh_bevel.cc:6991) - flat meshes hit this.
     TINY = _val(nt, (X + 300, 620), 1e-6)
-    FLAT = _math(nt, (X + 440, 620), "MULTIPLY", AMT,
-                 _val(nt, (X + 300, 720), 0.01))
-    o_w = _sw(nt, (X + 700, 400), "FLOAT",
-              _cmp(nt, (X + 560, 500), "FLOAT", "LESS_THAN", z_w, TINY),
-              false=_math(nt, (X + 440, 400), "DIVIDE", AMT,
-                          _math(nt, (X + 340, 480), "MAXIMUM", z_w, TINY)),
-              true=FLAT)
-    o_d = _sw(nt, (X + 700, 200), "FLOAT",
-              _cmp(nt, (X + 560, 300), "FLOAT", "LESS_THAN", z_d, TINY),
-              false=_math(nt, (X + 440, 200), "DIVIDE", AMT,
-                          _math(nt, (X + 340, 280), "MAXIMUM", z_d, TINY)),
-              true=FLAT)
-    o_p = _math(nt, (X + 440, 0), "DIVIDE",
-                _math(nt, (X + 220, 60), "MULTIPLY", elen, PCT), P100)
 
-    # Same cascade rule as above: each level passes its result on.
-    off = AMT
-    off = _sw(nt, (X + 900, -120), "FLOAT",
-              _eq_i(nt, (X + 780, 120), WM, WM_WIDTH), false=off, true=o_w)
-    off = _sw(nt, (X + 1100, -120), "FLOAT",
-              _eq_i(nt, (X + 980, 120), WM, WM_DEPTH), false=off, true=o_d)
-    off = _sw(nt, (X + 1300, -120), "FLOAT",
-              _eq_i(nt, (X + 1180, 120), WM, WM_PERCENT), false=off, true=o_p)
-    off = _sw(nt, (X + 1500, -120), "FLOAT",
-              _eq_i(nt, (X + 1380, 120), WM, WM_ABSOLUTE), false=off, true=AMT)
-    # ZERO-width guard: a 0 offset must be a no-op
-    off = _sw(nt, (X + 1500, -320), "FLOAT",
-              _cmp(nt, (X + 1380, -220), "FLOAT", "LESS_THAN", off, EPS),
-              false=off, true=ZERO)
+    def convert(src, row):
+        """Run one user amount through the Width Method conversion."""
+        flat = _math(nt, (X + 60, row), "MULTIPLY", src, P1)
+        ow = _sw(nt, (X + 340, row), "FLOAT",
+                 _cmp(nt, (X + 200, row + 100), "FLOAT", "LESS_THAN",
+                      z_w, TINY),
+                 false=_math(nt, (X + 60, row - 80), "DIVIDE", src,
+                             _math(nt, (X - 60, row - 140), "MAXIMUM",
+                                   z_w, TINY)),
+                 true=flat)
+        od = _sw(nt, (X + 340, row - 180), "FLOAT",
+                 _cmp(nt, (X + 200, row - 80), "FLOAT", "LESS_THAN",
+                      z_d, TINY),
+                 false=_math(nt, (X + 60, row - 260), "DIVIDE", src,
+                             _math(nt, (X - 60, row - 320), "MAXIMUM",
+                                   z_d, TINY)),
+                 true=flat)
+        op = _math(nt, (X + 60, row - 420), "DIVIDE",
+                   _math(nt, (X - 60, row - 360), "MULTIPLY", elen, src),
+                   P100)
+        v = src
+        v = _sw(nt, (X + 540, row - 40), "FLOAT",
+                _eq_i(nt, (X + 420, row + 60), WM, WM_WIDTH),
+                false=v, true=ow)
+        v = _sw(nt, (X + 720, row - 40), "FLOAT",
+                _eq_i(nt, (X + 600, row + 60), WM, WM_DEPTH),
+                false=v, true=od)
+        v = _sw(nt, (X + 900, row - 40), "FLOAT",
+                _eq_i(nt, (X + 780, row + 60), WM, WM_PERCENT),
+                false=v, true=op)
+        # ZERO-width guard: a 0 offset must be a no-op
+        return _sw(nt, (X + 1080, row - 40), "FLOAT",
+                   _cmp(nt, (X + 960, row + 60), "FLOAT", "LESS_THAN",
+                        v, EPS),
+                   false=v, true=ZERO)
+
+    OFF = [convert(AMT[i], 400 - 800 * i) for i in range(4)]
 
     # -------------------------------------------------------------- miter
-    # The native node exposes a single Miter flag.  Measured against the
-    # modifier over every combination of Miter Outer/Inner it maps exactly
-    # onto the *inner* miter: Sharp -> off, Arc -> on.  Miter Outer has no
-    # counterpart, so it is accepted and ignored.
-    miter = _eq_i(nt, (X + 1300, -620), MI, 1)
+    # "Either side asks for a miter".  The native kernel has a single flag with
+    # two states - off == (Sharp, Sharp), on == (Patch, Arc) - so the outer
+    # pattern always comes out as the kernel's Patch; everything else about the
+    # four reachable-modifier combinations is documented on the sockets.
+    miter = _or(nt, (X + 1300, -1200),
+                _eq_i(nt, (X + 1100, -1120), MI, 1),      # Miter Inner = Arc
+                _ge_i(nt, (X + 1100, -1280), MO, 1))      # Miter Outer != Sharp
 
     # ------------------------------------------------------------- bevel(s)
     X += 1800
 
-    def bevel_node(loc, affect, selection, offsets):
+    def bevel_node(loc, affect, selection):
         nd = _n(nt, "GeometryNodeMeshBevel", loc)
         _l(nt, GEO, nd.inputs["Mesh"])
         _l(nt, selection, nd.inputs["Selection"])
         nd.inputs["Affect Kind"].default_value = affect
         if affect == "Edges":
-            for nm in ("Start Left Offset", "Start Right Offset",
-                       "End Left Offset", "End Right Offset"):
-                _l(nt, offsets, nd.inputs[nm])
+            for nm, off in zip(OFFSET_NAMES, OFF):
+                _l(nt, off, nd.inputs[nm])
             nd.inputs["Offset"].default_value = 0.1
         else:
-            _l(nt, offsets, nd.inputs["Offset"])
-            for nm in ("Start Left Offset", "Start Right Offset",
-                       "End Left Offset", "End Right Offset"):
+            # Vertex bevel takes a single offset; the start-left one is used,
+            # which is the same value the modifier would apply.
+            _l(nt, OFF[0], nd.inputs["Offset"])
+            for nm in OFFSET_NAMES:
                 nd.inputs[nm].default_value = 0.1
         _l(nt, SEG, nd.inputs["Segments"])
         _l(nt, PROF, nd.inputs["Shape"])
@@ -540,18 +540,12 @@ def build(group_name=GROUP_NAME, nt=None):
         _l(nt, SPR, nd.inputs["Spread"])
         return nd
 
-    bx_e = bevel_node((X, 300), "Edges", lim_e, off)
-    bx_v = bevel_node((X, -400), "Vertices", lim_v, off)
-
-    # custom profile: only wired in when Profile Type == 1
-    psel = _eq_i(nt, (X - 200, -700), PTYPE, 1)
-    pgeo = _sw(nt, (X - 40, -780), "GEOMETRY", psel, false=None, true=CPROF)
-    _l(nt, pgeo, bx_e.inputs["Profile"])
-    _l(nt, pgeo, bx_v.inputs["Profile"])
+    bx_e = bevel_node((X, 300), "Edges", lim_e)
+    bx_v = bevel_node((X, -400), "Vertices", lim_v)
 
     is_vert = _eq_i(nt, (X + 180, 120), AFF, 1)
-    BEVEL = _sw(nt, (X + 300, -60), "GEOMETRY", is_vert,
-                false=bx_e.outputs["Mesh"], true=bx_v.outputs["Mesh"])
+    geo = _sw(nt, (X + 300, -60), "GEOMETRY", is_vert,
+              false=bx_e.outputs["Mesh"], true=bx_v.outputs["Mesh"])
 
     # ------------------------------------------------------- selections
     # The Selections panel outputs are anonymous attributes; pick the pair
@@ -566,7 +560,6 @@ def build(group_name=GROUP_NAME, nt=None):
     MEDGE = pick("Mid Edge")
 
     NEW_FACE = _or(nt, (X + 560, 520), VFACE, EFACE)
-    NEW_EDGE = _or(nt, (X + 560, 380), OEDGE, MEDGE)
 
     # Every edge the bevel touched: an edge that has at least one generated
     # face on either side.  The Selections panel has no name for that, so it is
@@ -586,48 +579,13 @@ def build(group_name=GROUP_NAME, nt=None):
                   (X + 1180, 20)).outputs["Corner Index"]
     e_tot = _fai(nt, (X + 1400, 140), "CORNER", "INT",
                  acc.outputs["Total"], e_corner)
-    NEW_EDGE_ALL = _cmp(nt, (X + 1620, 140), "INT", "GREATER_THAN", e_tot, 0)
-
-    # ----------------------------------------------------- post-processing
-    geo = BEVEL
-
-    # material index of the generated faces
-    mat_ok = _cmp(nt, (X + 560, 120), "INT", "GREATER_EQUAL", MAT, 0)
-    mat_prev = _named(nt, (X + 560, 0), "material_index", "INT")
-    mat_val = _sw(nt, (X + 760, 60), "INT", NEW_FACE, false=mat_prev, true=MAT)
-    mat_geo = _store(nt, (X + 980, 60), geo, "material_index", "INT", "FACE",
-                     mat_val)
-    geo = _sw(nt, (X + 1200, 60), "GEOMETRY", mat_ok, false=geo, true=mat_geo)
-
-    # face strength (__mod_weightednormals_faceweight), exactly the values the
-    # bmesh kernel writes per FKind
-    recon = _not(nt, (X + 560, -180), NEW_FACE)
-    big = _bool(nt, (X + 760, -180), "AND",
-                _ge_i(nt, (X + 620, -300), FSTR, 2), recon)
-    fs = _sw(nt, (X + 980, -180), "INT", big, false=0, true=FS_STRONG)
-    fs = _sw(nt, (X + 1200, -180), "INT",
-             _bool(nt, (X + 1060, -400), "AND",
-                   _ge_i(nt, (X + 920, -520), FSTR, 1), VFACE),
-             false=fs, true=FS_WEAK)
-    fs_geo = _store(nt, (X + 1420, -180), geo, "__mod_weightednormals_faceweight",
-                    "INT", "FACE", fs)
-    geo = _sw(nt, (X + 1640, -180), "GEOMETRY",
-              _eq_i(nt, (X + 1500, -420), FSTR, 0), false=fs_geo, true=geo)
-
-    # seam / sharp on the generated edges
-    for nm, flag, attr in (("seam", MSEAM, "uv_seam"),
-                           ("sharp", MSHARP, "sharp_edge")):
-        prev = _named(nt, (X + 560, -700), attr, "BOOLEAN")
-        val = _or(nt, (X + 760, -700), prev, NEW_EDGE)
-        stored = _store(nt, (X + 980, -700), geo, attr, "BOOLEAN", "EDGE", val)
-        geo = _sw(nt, (X + 1200, -700), "GEOMETRY", flag, false=geo,
-                  true=stored)
+    NEW_EDGE = _cmp(nt, (X + 1620, 140), "INT", "GREATER_THAN", e_tot, 0)
 
     # ------------------------------------------------------------ outputs
     GOUT = _n(nt, "NodeGroupOutput", (X + 1900, -60))
     _l(nt, geo, GOUT.inputs["Geometry"])
     _l(nt, NEW_FACE, GOUT.inputs["Bevel Faces"])
-    _l(nt, NEW_EDGE_ALL, GOUT.inputs["Bevel Edges"])
+    _l(nt, NEW_EDGE, GOUT.inputs["Bevel Edges"])
 
     return nt
 
