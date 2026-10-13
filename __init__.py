@@ -16,9 +16,10 @@ Individual / Boundary / Outset / Edge Rail.
 parameter surface exposed - the native node's four offsets (each run through
 the Width Method: Offset / Width / Depth / Percent / Absolute) / Segments /
 Profile / Limit Method (Angle / Weight / Vertex Group) / Affect (Edges /
-Vertices) / Miter Outer & Inner / Spread - plus ``Bevel Faces`` and
-``Bevel Edges`` selection outputs.  ``Miter Outer`` and ``Miter Inner`` drive
-the native miter flag independently, per vertex.
+Vertices) / Miter / Spread - plus ``Bevel Faces`` and ``Bevel Edges``
+selection outputs.  ``Miter`` is a single boolean, exactly like the native
+``Mesh Bevel`` node's input; it reproduces the modifier's ``(Sharp, Sharp)``
+and ``(Patch, Arc)`` combinations bit for bit.
 
 Both node groups are built at runtime by ``ngs.inset_faces`` / ``ngs.bevel``
 (no .blend asset to ship).
@@ -30,7 +31,7 @@ native ``Mesh Bevel`` node.
 bl_info = {
     "name": "BI1MCS_GN",
     "author": "BI1MCS",
-    "version": (0, 4, 0),
+    "version": (0, 5, 0),
     "blender": (5, 2, 0),
     "location": "Node Editor > Add > BI1MCS > Inset Faces / Bevel",
     "description": ("Geometry-Nodes toolset. 'Inset Faces' reproduces the "
