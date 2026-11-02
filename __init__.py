@@ -33,9 +33,10 @@ never silently substitutes Simple.
 
 ``trapezoid`` is a generator (no Geometry input): a subdivided grid sheared into
 an isosceles trapezoid from Bottom Width / Top Width / Height, with optional
-X/Y subdivisions and an ``Force Angle`` mode that derives the top width from the
-leg angle (``Bottom - 2 * Height / tan(Angle)``).  Rebuilt from the ``梯形``
-group inside ``Window_01`` of ``BuildBase.blend`` (Scene_M2).
+X/Y subdivisions and a ``Force Angle`` mode that derives the top width from the
+leg angle (``Bottom - 2 * Height / tan(radians(Angle))``; ``Angle`` is a plain
+float in degrees).  Rebuilt from the ``梯形`` group inside ``Window_01`` of
+``BuildBase.blend`` (Scene_M2).
 
 All node groups are built at runtime (no .blend asset to ship).
 

@@ -17,7 +17,7 @@ Algorithm (identical to the source graph, except where noted below)
                       Vertices X = Subdivisions X + 2,
                       Vertices Y = Subdivisions Y + 2)   # centred on origin
     t     = y / Height + 0.5                    # 0 at the bottom edge, 1 at top
-    Top   = Force Angle ? Bottom - 2 * Height / tan(Angle) : Top Width
+    Top   = Force Angle ? Bottom - 2 * Height / tan(radians(Angle)) : Top Width
     r     = Top / Bottom
     x'    = x + x * (t * (r - 1))               # uniform horizontal taper
     y'    = y,  z' = z
@@ -28,20 +28,22 @@ a planar isosceles trapezoid (or a rectangle / degenerate triangle when
 [-Height/2, Height/2]`` and lies in the XY plane, exactly like the source.
 
 ``Force Angle`` derives the top width from the leg angle instead of taking
-``Top Width``: a leg that leans ``Angle`` radians away from vertical removes
-``Height / tan(Angle)`` from each side of the top edge (45 deg is the source
-default, 90 deg gives vertical legs and a rectangle).
+``Top Width``: a leg that leans ``Angle`` **degrees** away from vertical removes
+``Height / tan(radians(Angle))`` from each side of the top edge (45 deg is the
+source default, 90 deg gives vertical legs and a rectangle).
 
-One deliberate divergence from the source group
------------------------------------------------
-The source graph runs the angle socket through a ``Radians`` node before
-``Tangent``.  ``Angle`` is an ``ANGLE`` socket, so Blender already stores it in
-radians and the extra conversion shrinks it by 57.3x: at the 45 deg default the
-source computes ``Bottom - 2*Height/tan(0.0137)`` and returns a 143 unit wide
-inverted shape instead of a trapezoid.  That is a unit bug, not the documented
-intent (the source's own frame label reads ``底边-2*高度/tangent角度``), so this
-node consumes ``Angle`` as a real radian angle: ``Bottom - 2*Height/tan(Angle)``.
-``Force Angle = False`` (the default) still matches the source bit for bit.
+Why ``Angle`` is a plain float in degrees
+-----------------------------------------
+The source group declares its angle socket as an ``ANGLE`` socket - whose value
+is stored in radians - but feeds it straight into ``Radians`` -> ``Tangent``, so
+the number it actually consumes is degrees.  Typing the visible default (45 deg
+= 0.785 stored) therefore computes ``Bottom - 2*Height/tan(0.0137)`` and returns
+a 143 unit wide inverted shape; only a raw driven value of ``45`` produces the
+intended trapezoid.  This node removes the ambiguity: ``Angle`` is a plain
+``Float`` in degrees (default 45) and is converted internally, so the value shown
+in the modifier, the value typed in the socket and the value driven from a field
+all mean the same thing.  At equal numeric input it matches the source graph bit
+for bit, including ``Force Angle`` on.
 
 Degenerate guards (deliberate, documented divergence points)
 -----------------------------------------------------------
@@ -57,17 +59,20 @@ Requires Blender 5.2+ (``MIN_BLENDER`` is shared with the rest of the add-on,
 not with a specific node here).
 """
 import bpy
+from math import degrees
 
 from .extrude import _Graph, _interface, MIN_BLENDER, is_supported
 
 GROUP_NAME = "trapezoid"
 # bump together with bl_info["version"]; a group carrying a different tag was
 # built by an older release and gets rebuilt in place on next use.
-VERSION = (0, 1, 0)
+# 0.2.0: Angle became a plain float in DEGREES (was an ANGLE socket feeding
+#        Radians, i.e. the stored radian value was re-converted as degrees).
+VERSION = (0, 2, 0)
 
 EPSILON = 1e-8
-# tan(45 deg), the source group's default leg angle
-DEFAULT_ANGLE = 0.7853981633974483
+# the source group's default leg angle, in degrees
+DEFAULT_ANGLE = 45.0
 
 
 def _guard(g, value, fallback):
@@ -77,12 +82,12 @@ def _guard(g, value, fallback):
 
 
 def _top_width(g, inputs):
-    """``Force Angle ? Bottom - 2 * Height / tan(Angle) : Top Width``.
+    """``Force Angle ? Bottom - 2 * Height / tan(radians(Angle)) : Top Width``.
 
-    ``Angle`` is an ANGLE socket, i.e. already radians - no Radians node here
-    (the source group has one, which is the unit bug documented above).
+    ``Angle`` is a plain float in degrees, so it is converted here - the source
+    graph's ``Radians`` node does the same thing to a value it also calls degrees.
     """
-    tangent = g.math("TANGENT", inputs["Angle"])
+    tangent = g.math("TANGENT", g.math("RADIANS", inputs["Angle"]))
     inset = g.math("MULTIPLY", g.math("DIVIDE", inputs["Height"], tangent), 2)
     forced = g.math("SUBTRACT", inputs["Bottom Width"], inset)
     return g.switch("FLOAT", inputs["Force Angle"], inputs["Top Width"], forced)
@@ -112,14 +117,19 @@ def build(group_name=GROUP_NAME, nt=None):
     sockets = _interface(nt, specs, [("Geometry", "Geometry")])
     for name in ("Bottom Width", "Top Width", "Height"):
         sockets[(name, "INPUT")].subtype = "DISTANCE"
-    sockets[("Angle", "INPUT")].subtype = "ANGLE"
     sockets[("Bottom Width", "INPUT")].description = "Width of the bottom edge (the grid's Size X)"
     sockets[("Top Width", "INPUT")].description = "Width of the top edge; ignored when Force Angle is on"
     sockets[("Height", "INPUT")].description = "Distance between the bottom and top edges"
     sockets[("Subdivisions X", "INPUT")].description = "Extra columns; the grid always has at least 2 vertices across"
     sockets[("Subdivisions Y", "INPUT")].description = "Extra rows; the grid always has at least 2 vertices up"
     sockets[("Force Angle", "INPUT")].description = "Derive Top Width from the leg angle instead of using Top Width"
-    sockets[("Angle", "INPUT")].description = "Leg angle away from vertical when Force Angle is on"
+    angle = sockets[("Angle", "INPUT")]
+    # A group built by 0.1.0 declared this as an ANGLE socket; a rebuild keeps the
+    # socket (same type), so its subtype has to be reset explicitly.
+    angle.subtype = "NONE"
+    angle.description = ("Leg angle away from vertical, in DEGREES (converted to radians "
+                         "internally; 45 = 1:1 slope, 90 = vertical legs). Values above 90 "
+                         "lean the other way, giving a top edge wider than the bottom.")
     nt.description = ("Isosceles trapezoid grid: bottom/top width, height, "
                       "X/Y subdivisions and an optional leg-angle driven top width")
 
@@ -152,12 +162,74 @@ def build(group_name=GROUP_NAME, nt=None):
     return nt
 
 
+def _migrate_angle_values(group):
+    """Convert stored ``Angle`` values of a 0.1.0 group from radians to degrees.
+
+    0.1.0 declared ``Angle`` as an ANGLE socket, so every instance stored radians
+    (45 deg -> 0.785).  0.2.0 reads the same number as degrees, so an untouched
+    instance would suddenly mean 0.785 deg.  Linked sockets are fields and cannot
+    be migrated here; only literal values are rewritten.
+    """
+    def convert(value):
+        return degrees(value) if abs(value) > 1e-9 else value
+
+    for tree in bpy.data.node_groups:
+        for node in tree.nodes:
+            if node.bl_idname != 'GeometryNodeGroup' or node.node_tree != group:
+                continue
+            socket = node.inputs.get('Angle')
+            if socket is not None and not socket.is_linked:
+                socket.default_value = convert(socket.default_value)
+    identifiers = [s.identifier for s in group.interface.items_tree
+                   if s.item_type == 'SOCKET' and s.in_out == 'INPUT'
+                   and s.name == 'Angle']
+    for obj in bpy.data.objects:
+        for mod in obj.modifiers:
+            if mod.type != 'NODES' or mod.node_group != group:
+                continue
+            for identifier in identifiers:
+                holder = getattr(getattr(mod, 'properties', None), 'inputs', None)
+                holder = getattr(holder, identifier, None) if holder is not None else None
+                if holder is not None and hasattr(holder, 'value'):
+                    holder.value = convert(holder.value)
+                elif identifier in mod_ids(mod):
+                    mod[identifier] = convert(mod[identifier])
+
+
+def mod_ids(mod):
+    try:
+        return list(mod.keys())
+    except TypeError:
+        return []
+
+
+def _tagged_groups():
+    return [g for g in bpy.data.node_groups
+            if g.bl_idname == "GeometryNodeTree" and g.get("bi1mcs_tool") == GROUP_NAME]
+
+
 def get_or_create_group(name=GROUP_NAME):
+    """Return the ``trapezoid`` group, building it the first time.
+
+    Blender IDs are unique **case-insensitively**, so a file that already owns a
+    group called ``Trapezoid`` (``BuildBase.blend`` does) forces ours to be named
+    ``trapezoid.001`` no matter what.  A pure name lookup would then miss it and
+    pile up ``trapezoid.002``, ``trapezoid.003`` ... on every insert, so the group
+    is identified by its ``bi1mcs_tool`` tag as well, and a foreign group that
+    merely occupies the name is never overwritten.
+    """
     nt = bpy.data.node_groups.get(name)
-    if nt is None:
-        return build(name)
+    if nt is None or nt.get("bi1mcs_tool") != GROUP_NAME:
+        tagged = _tagged_groups()
+        if tagged:
+            nt = tagged[0]
+        elif nt is None:
+            return build(name)
     if nt.bl_idname != "GeometryNodeTree":
         raise TypeError("Existing group is not a GeometryNodeTree")
-    if nt.get("bi1mcs_version") != ".".join(map(str, VERSION)):
-        return build(name, nt)
+    version = nt.get("bi1mcs_version")
+    if version != ".".join(map(str, VERSION)):
+        if version == "0.1.0":
+            _migrate_angle_values(nt)
+        return build(nt.name, nt)
     return nt
