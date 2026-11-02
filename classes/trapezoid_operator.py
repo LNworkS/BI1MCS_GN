@@ -1,0 +1,35 @@
+# -*- coding: utf-8 -*-
+"""Insert the runtime trapezoid group in the geometry node editor."""
+import bpy
+from ..ngs.trapezoid import GROUP_NAME, get_or_create_group, is_supported
+from .inset_faces_operator import _node_editor, insert_group_node
+
+menu_entry = ('node.bi1mcs_trapezoid', GROUP_NAME)
+
+
+class NODE_OT_bi1mcs_trapezoid(bpy.types.Operator):
+    bl_idname = 'node.bi1mcs_trapezoid'
+    bl_label = GROUP_NAME
+    bl_description = ('Isosceles trapezoid grid: bottom/top width, height, '
+                      'X/Y subdivisions and an optional leg-angle driven top width')
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        space = _node_editor(context)
+        return space is not None and getattr(space, 'edit_tree', None) is not None
+
+    def execute(self, context):
+        if not is_supported():
+            self.report({'ERROR'}, 'trapezoid needs Blender 5.2 or newer')
+            return {'CANCELLED'}
+        space = _node_editor(context)
+        tree = getattr(space, 'edit_tree', None)
+        if tree is None:
+            return {'CANCELLED'}
+        node = insert_group_node(tree, space, get_or_create_group(), GROUP_NAME)
+        node.width = 240
+        return {'FINISHED'}
+
+
+classes = (NODE_OT_bi1mcs_trapezoid,)
